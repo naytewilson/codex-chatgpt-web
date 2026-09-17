@@ -89,7 +89,7 @@ describe("Local Agent Gateway outer-runtime contract", () => {
       cwd: root,
       roots: [root],
       writableRoots: [],
-      sandboxPolicy: { type: "readOnly" },
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
       tools: [{
         name: "echo_value",
         description: "echo a value",
