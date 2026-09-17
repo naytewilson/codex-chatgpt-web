@@ -1,14 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
+import type { ProviderAdapter } from "../src/adapters/base";
 import {
   extractChatGptTurnEnvironment,
   extractChatGptTurnIdentity,
 } from "../src/adapters/chatgpt-web/environment";
+import { defaultConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
-import {
-  expandPreviousResponseInput,
-  rememberResponseState,
-} from "../src/responses/state";
+import { responseRequest } from "../src/server";
+import type { CodexParsedRequest } from "../src/types";
 
 const root = resolve(process.cwd());
 const threadId = "thread_gateway_0123456789abcdef0123456789abcdef";
@@ -69,6 +69,14 @@ function gatewayInitialBody(): Record<string, unknown> {
   };
 }
 
+function jsonRequest(body: Record<string, unknown>): Request {
+  return new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 describe("Local Agent Gateway outer-runtime contract", () => {
   test("accepts the exact Gateway-owned read-only turn envelope without weakening trust parsing", () => {
     const parsed = parseRequest(gatewayInitialBody());
@@ -94,31 +102,67 @@ describe("Local Agent Gateway outer-runtime contract", () => {
     });
   });
 
-  test("replays a Gateway tool continuation under the same trusted browser turn", () => {
-    const initial = gatewayInitialBody();
-    rememberResponseState(initial, {
-      id: "resp_gateway_outer_runtime_1",
+  test("responseRequest force-replays a Gateway tool continuation on the same trusted browser turn", async () => {
+    const config = defaultConfig("browser-only");
+    const parsedRequests: CodexParsedRequest[] = [];
+    let runCount = 0;
+
+    const adapter: ProviderAdapter = {
+      name: "gateway-outer-runtime-test",
+      async runTurn(parsed, _incoming, emit) {
+        parsedRequests.push(parsed);
+        runCount += 1;
+        if (runCount === 1) {
+          emit({ type: "tool_call_start", id: "wire_call_1", name: "echo_value" });
+          emit({ type: "tool_call_delta", arguments: "{\"value\":\"x\"}" });
+          emit({ type: "tool_call_end" });
+          emit({ type: "done", endTurn: false, stopReason: "tool_use" });
+          return;
+        }
+        emit({ type: "text_delta", text: "done", phase: "final_answer" });
+        emit({ type: "done", endTurn: true });
+      },
+    };
+
+    const firstResponse = await responseRequest(
+      jsonRequest(gatewayInitialBody()),
+      config,
+      () => adapter,
+    );
+    expect(firstResponse.status).toBe(200);
+    const firstJSON = await firstResponse.json() as {
+      id: string;
+      status: string;
+      output: Array<Record<string, unknown>>;
+    };
+    expect(firstJSON.status).toBe("completed");
+    expect(firstJSON.id).toMatch(/^resp_/);
+    const functionCall = firstJSON.output.find(item => item.type === "function_call");
+    expect(functionCall).toMatchObject({
+      type: "function_call",
+      call_id: "wire_call_1",
+      name: "echo_value",
+      arguments: "{\"value\":\"x\"}",
       status: "completed",
-      output: [{
-        id: "fc_gateway_outer_runtime_1",
-        type: "function_call",
-        status: "completed",
-        call_id: "wire_call_1",
-        name: "echo_value",
-        arguments: "{\"value\":\"x\"}",
-      }],
-    }, { force: true });
+    });
+    expect(parsedRequests).toHaveLength(1);
+    expect(extractChatGptTurnEnvironment(parsedRequests[0]!)).toMatchObject({
+      cwd: root,
+      roots: [root],
+      writableRoots: [],
+      sandboxPolicy: { type: "readOnly" },
+    });
 
     const continuation = {
       model: "chatgpt-web/high",
-      previous_response_id: "resp_gateway_outer_runtime_1",
+      previous_response_id: firstJSON.id,
       input: [{
         type: "function_call_output",
         call_id: "wire_call_1",
         output: "OUT",
         internal_chat_message_metadata_passthrough: { turn_id: turnId },
       }],
-      tools: (initial.tools as unknown[]),
+      tools: (gatewayInitialBody().tools as unknown[]),
       parallel_tool_calls: true,
       stream: false,
       store: false,
@@ -126,18 +170,36 @@ describe("Local Agent Gateway outer-runtime contract", () => {
       client_metadata: { "x-codex-turn-metadata": metadata() },
     };
 
-    const expanded = expandPreviousResponseInput(continuation);
-    const parsed = parseRequest(expanded);
+    const secondResponse = await responseRequest(
+      jsonRequest(continuation),
+      config,
+      () => adapter,
+    );
+    expect(secondResponse.status).toBe(200);
+    const secondJSON = await secondResponse.json() as {
+      status: string;
+      end_turn?: boolean;
+      output: Array<Record<string, unknown>>;
+    };
+    expect(secondJSON.status).toBe("completed");
+    expect(secondJSON.end_turn).toBe(true);
+    expect(secondJSON.output).toContainEqual(expect.objectContaining({
+      type: "message",
+      role: "assistant",
+      content: [expect.objectContaining({ type: "output_text", text: "done" })],
+    }));
 
-    expect(parsed.previousResponseId).toBe("resp_gateway_outer_runtime_1");
-    expect(extractChatGptTurnIdentity(parsed)).toMatchObject({ threadId, turnId });
-    expect(extractChatGptTurnEnvironment(parsed)).toMatchObject({
+    expect(runCount).toBe(2);
+    expect(parsedRequests).toHaveLength(2);
+    expect(parsedRequests[1]!.previousResponseId).toBe(firstJSON.id);
+    expect(extractChatGptTurnIdentity(parsedRequests[1]!)).toMatchObject({ threadId, turnId });
+    expect(extractChatGptTurnEnvironment(parsedRequests[1]!)).toMatchObject({
       cwd: root,
       roots: [root],
       writableRoots: [],
       sandboxPolicy: { type: "readOnly" },
     });
-    const toolResult = parsed.context.messages.find(message => message.role === "toolResult");
+    const toolResult = parsedRequests[1]!.context.messages.find(message => message.role === "toolResult");
     expect(toolResult).toMatchObject({
       role: "toolResult",
       toolCallId: "wire_call_1",
