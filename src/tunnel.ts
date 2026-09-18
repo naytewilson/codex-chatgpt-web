@@ -361,31 +361,27 @@ export function parseTunnelStatus(output: string, alias: string, exitStatus = 0)
   }
   try {
     const parsed = JSON.parse(output) as Record<string, unknown>;
-    if (!Array.isArray(parsed.entries)) throw new Error("local inventory has no entries array");
-    const matches = parsed.entries.filter(entry => entry?.alias === alias);
-    if (matches.length > 1) throw new Error("local inventory contains duplicate aliases");
-    const state = matches.length === 0 ? "stopped" : matches[0].runtime_state;
-    if (!["stopped", "starting", "healthy", "ready"].includes(state)) {
-      throw new Error("local inventory has an unsupported runtime state");
-    }
-    // tunnel-client 0.0.12 derives these states from the live process and local healthz/readyz
-    // probes. It does not need the optional remote control-plane lookup made by `status`.
-    const processRunning = state !== "stopped";
-    const healthy = state === "healthy" || state === "ready";
-    const ready = state === "ready";
-    const ok = processRunning && healthy && ready;
-    const detail = ok
-      ? "process_running=true healthy=true ready=true"
-      : safeTunnelDetail([
-        `process_running=${processRunning}`,
-        `healthy=${healthy}`,
-        `ready=${ready}`,
-        `state=${state}`,
-        ...(matches.length === 0 ? ["local_inventory=absent"] : []),
-      ].join("; "));
+    if (parsed.alias !== alias) throw new Error("runtime status is for a different alias");
+    const local = nestedRecord(parsed, "local");
+    const processRunning = parsed.process_running === true || local?.process_running === true;
+    const healthy = parsed.healthy === true;
+    const ready = parsed.ready === true;
+    const state = typeof parsed.runtime_state === "string" ? parsed.runtime_state : undefined;
+    // The process inventory only covers runtimes under tunnel-client's own supervision. A
+    // committed runtime owned by an OS service manager (launchd, systemd) is invisible to it,
+    // so the runtime's own healthz/readyz probes are the authoritative liveness signal.
+    const ok = healthy && ready;
+    const error = typeof parsed.error === "string" && parsed.error.trim() ? parsed.error.trim() : undefined;
+    const detail = safeTunnelDetail([
+      `process_running=${processRunning}`,
+      `healthy=${healthy}`,
+      `ready=${ready}`,
+      ...(state !== undefined ? [`state=${state}`] : []),
+      ...(error ? [`error=${error}`] : []),
+    ].join("; "));
     return { ok, processRunning, healthy, ready, state, detail };
   } catch (error) {
-    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned invalid local inventory: ${safeTunnelDetail(error instanceof Error ? error.message : String(error))}` };
+    return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned invalid runtime status: ${safeTunnelDetail(error instanceof Error ? error.message : String(error))}` };
   }
 }
 
@@ -396,7 +392,7 @@ export function tunnelStatus(config: AppConfig): TunnelRuntimeStatus {
   }
   const result = runCommand(
     settings.binaryPath,
-    ["runtimes", "cleanup", "--json"],
+    ["runtimes", "status", settings.alias, "--json"],
     { timeout: 10_000 },
   );
   return parseTunnelStatus(tunnelCommandOutput(result), settings.alias, result.status);

@@ -12,22 +12,32 @@ test("pins the fixed tunnel-client and migrates only the previously shipped vers
 describe("tunnel status boundary", () => {
   test("requires the exact alias to have a locally verified ready runtime", () => {
     expect(parseTunnelStatus(JSON.stringify({
-      entries: [{ alias: "ours", runtime_state: "ready" }],
+      alias: "ours", process_running: true, healthy: true, ready: true, runtime_state: "ready",
     }), "ours")).toEqual({
       ok: true,
       processRunning: true,
       healthy: true,
       ready: true,
       state: "ready",
-      detail: "process_running=true healthy=true ready=true",
+      detail: "process_running=true; healthy=true; ready=true; state=ready",
     });
     for (const state of ["stopped", "starting", "healthy"]) {
-      expect(parseTunnelStatus(JSON.stringify({ entries: [
-        { alias: "other", runtime_state: "ready" }, { alias: "ours", runtime_state: state },
-      ] }), "ours")).toMatchObject({
+      expect(parseTunnelStatus(JSON.stringify({
+        alias: "ours", process_running: state !== "stopped",
+        healthy: state === "healthy", ready: false, runtime_state: state,
+      }), "ours")).toMatchObject({
         ok: false, processRunning: state !== "stopped", healthy: state === "healthy", ready: false,
       });
     }
+  });
+
+  test("accepts a service-managed runtime invisible to the process inventory", () => {
+    // On macOS the committed runtime runs under launchd; the process inventory reports it
+    // stopped while the runtime's own healthz/readyz probes prove it is serving.
+    expect(parseTunnelStatus(JSON.stringify({
+      alias: "ours", process_running: false, healthy: true, ready: true, runtime_state: "stopped",
+      local: { process_running: false, runtime_state: "stopped" },
+    }), "ours")).toMatchObject({ ok: true, healthy: true, ready: true });
   });
 
   test("redacts tunnel ids and keys from safe diagnostics", () => {
@@ -78,14 +88,12 @@ describe("tunnel status boundary", () => {
     expect(tunnelConnectLaunchError("not json")).toBe("tunnel-client returned non-JSON connect output");
   });
 
-  test("missing, ambiguous, or malformed local inventory cannot report ready", () => {
-    const ready = { alias: "ours", runtime_state: "ready" };
-    for (const output of ["invalid JSON", "{}", JSON.stringify({ entries: [ready, ready] }),
-      JSON.stringify({ entries: [{ ...ready, runtime_state: "unknown" }] })]) {
+  test("missing, ambiguous, or malformed runtime status cannot report ready", () => {
+    for (const output of ["invalid JSON", "{}", JSON.stringify({ alias: "other", healthy: true, ready: true })]) {
       expect(parseTunnelStatus(output, "ours")).toMatchObject({ ok: false, ready: false });
-      expect(parseTunnelStatus(output, "ours").detail).toContain("invalid local inventory");
+      expect(parseTunnelStatus(output, "ours").detail).toContain("invalid runtime status");
     }
-    expect(parseTunnelStatus(JSON.stringify({ entries: [{ ...ready, alias: "other" }] }), "ours"))
+    expect(parseTunnelStatus(JSON.stringify({ alias: "ours", healthy: false, ready: false, runtime_state: "stopped" }), "ours"))
       .toMatchObject({ ok: false, processRunning: false, healthy: false, ready: false, state: "stopped" });
   });
 
